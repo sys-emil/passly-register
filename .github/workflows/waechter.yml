@@ -1,0 +1,121 @@
+name: Wächter
+
+# Stündlich: neuesten Stand des Passly Registers prüfen, mit zwei unabhängigen
+# Implementierungen nachrechnen, die Fortsetzung des zuletzt hier gespeicherten
+# Stands beweisen und den neuen Stand committen. Einmal am Tag kommt ein
+# RFC-3161-Zeitstempel dazu. Schlägt ein Schritt fehl, bleibt der alte Stand
+# stehen und GitHub schickt eine Mail.
+#
+# Ruht, solange hier keine Datei `vkey` liegt: Sie kommt mit der Umstellung
+# von Passly auf das Register. Der erste Lauf danach hat noch keinen früheren
+# Stand und speichert einfach den ersten.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: waechter
+  cancel-in-progress: false
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Aktiv?
+        id: aktiv
+        run: |
+          if [ -s vkey ]; then echo "ja=true" >> "$GITHUB_OUTPUT"; else echo "Noch kein Prüfschlüssel (vkey): Register in Produktion noch nicht aktiv."; fi
+          if [ -s checkpoint ]; then echo "vorher=checkpoint" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-node@v4
+        if: steps.aktiv.outputs.ja == 'true'
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        if: steps.aktiv.outputs.ja == 'true'
+        with:
+          go-version-file: gegenprobe/go.mod
+          cache-dependency-path: gegenprobe/go.sum
+
+      # Exit 1 = Bruch (sofort rot), Exit 2 = nicht erreichbar (bis zu drei Versuche).
+      - name: Prüfen (Passly-Implementierung, jeder Eintrag)
+        if: steps.aktiv.outputs.ja == 'true'
+        env:
+          VORHER: ${{ steps.aktiv.outputs.vorher }}
+        run: |
+          vorher=(); [ -n "$VORHER" ] && vorher=(--vorher "$VORHER")
+          for i in 1 2 3; do
+            node pruefen.mjs stand --base "$(cat basis)" --vkey vkey "${vorher[@]}" --voll --schreibe checkpoint.neu && exit 0
+            code=$?; [ "$code" = 2 ] || exit "$code"; sleep 30
+          done
+          exit 2
+
+      - name: Gegenprobe (golang.org/x/mod/sumdb/tlog)
+        if: steps.aktiv.outputs.ja == 'true'
+        working-directory: gegenprobe
+        env:
+          VORHER: ${{ steps.aktiv.outputs.vorher }}
+        run: |
+          vorher=(); [ -n "$VORHER" ] && vorher=(-vorher "../$VORHER")
+          for i in 1 2 3; do
+            go run . -base "$(cat ../basis)" -vkey ../vkey "${vorher[@]}" && exit 0
+            code=$?; [ "$code" = 2 ] || exit "$code"; sleep 30
+          done
+          exit 2
+
+      - name: Neuen Stand speichern
+        if: steps.aktiv.outputs.ja == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! cmp -s checkpoint checkpoint.neu; then
+            mv checkpoint.neu checkpoint
+            git add checkpoint
+            git commit -q -m "Stand $(sed -n 2p checkpoint)"
+          fi
+          rm -f checkpoint.neu
+
+      # Erst nach bestandenen Prüfungen: der Zeuge unterschreibt nur, was den
+      # zuletzt gesehenen Stand fortsetzt. Neu bei jedem neuen Stand, sonst
+      # spätestens nach 20 Stunden, damit Browser sehen, dass er noch wacht.
+      - name: Als Zeuge gegenzeichnen
+        if: steps.aktiv.outputs.ja == 'true'
+        env:
+          ZEUGE_SCHLUESSEL: ${{ secrets.ZEUGE_SCHLUESSEL }}
+        run: |
+          [ -n "$ZEUGE_SCHLUESSEL" ] || { echo "kein ZEUGE_SCHLUESSEL gesetzt, übersprungen"; exit 0; }
+          zuletzt=$(git log -1 --format=%ct -- bezeugt)
+          alter=$(( $(date +%s) - ${zuletzt:-0} ))
+          if [ ! -f bezeugt ] || [ "$(sed -n 2p bezeugt)" != "$(sed -n 2p checkpoint)" ] || [ "$alter" -gt 72000 ]; then
+            node pruefen.mjs bezeugen --stand checkpoint --name github.com/sys-emil/passly-register --schreibe bezeugt
+            git add bezeugt
+            git commit -q -m "Bezeugt: Stand $(sed -n 2p checkpoint)"
+          fi
+
+      - name: Zeitstempel (einmal am Tag)
+        if: steps.aktiv.outputs.ja == 'true'
+        run: |
+          tag=$(date -u +%F)
+          [ -f "zeitstempel/$tag.tsr" ] && exit 0
+          cp checkpoint "zeitstempel/$tag.checkpoint"
+          openssl ts -query -data "zeitstempel/$tag.checkpoint" -sha256 -cert -out /tmp/anfrage.tsq
+          for i in 1 2 3; do
+            curl -fsS -H "Content-Type: application/timestamp-query" --data-binary @/tmp/anfrage.tsq https://freetsa.org/tsr -o "zeitstempel/$tag.tsr" && break
+            sleep 20
+          done
+          openssl ts -verify -in "zeitstempel/$tag.tsr" -data "zeitstempel/$tag.checkpoint" \
+            -CAfile zeitstempel/freetsa-cacert.pem -untrusted zeitstempel/freetsa-tsa.crt
+          git add "zeitstempel/$tag.checkpoint" "zeitstempel/$tag.tsr"
+          git commit -q -m "Zeitstempel $tag (Stand $(sed -n 2p checkpoint))"
+
+      - name: Hochladen
+        if: steps.aktiv.outputs.ja == 'true'
+        run: git push -q
